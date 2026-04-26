@@ -1,0 +1,185 @@
+name: Heh
+
+on:
+  push:
+    branches:
+      - "**"
+jobs:
+  save-file:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 python3 python3-pip python3-requests ffmpeg curl unzip zip
+          pip3 install "yt-dlp[default]"
+
+      - name: Install bun
+        run: |
+          curl -fsSL https://bun.com/install | bash
+          echo "$HOME/.bun/bin" >> $GITHUB_PATH
+
+      - name: Setup YouTube cookies
+        run: |
+          if [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
+            echo '${{ secrets.YOUTUBE_COOKIES }}' > youtube_cookies.txt
+          else
+            touch youtube_cookies.txt
+          fi
+
+      - name: Download bunkr module
+        run: |
+          cat << 'EOF' > bunkr.py
+          import os, sys, json, time, base64, requests
+          from math import floor
+          from itertools import cycle
+          from urllib.parse import urlparse
+
+          BUNKRR_API = "https://bunkr.cr/api/vs"
+          BUNKRR_DOMAINS = ("bunkr.si", "bunkr.fi", "bunkr.ru", "bunkr.cr", "bunkr.rip", "bunkrr.su")
+          BUNKRR_DOWNLOAD_HEADERS = {
+              "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
+              "Referer": "https://get.bunkrr.su/",
+              "Connection": "keep-alive",
+          }
+          _offline_subs = set()
+
+          def is_bunkr_url(url: str) -> bool:
+              return any(domain in url for domain in BUNKRR_DOMAINS)
+
+          def get_slug(url: str) -> str:
+              match = __import__("re").search(r"/([a-zA-Z0-9_-]+)$", url)
+              return match.group(1) if match else None
+
+          def fetch_bunkr_api(url: str) -> dict | None:
+              slug = get_slug(url)
+              if not slug: return None
+              payload = {"slug": slug}
+              for dom in (BUNKRR_API.split("/")[2], *_offline_subs):
+                  try:
+                      api_url = f"https://{dom}/api/vs"
+                      resp = requests.post(api_url, json=payload, headers=BUNKRR_DOWNLOAD_HEADERS, timeout=30)
+                      if resp.status_code == 200: return resp.json()
+                      if resp.status_code == 502: _offline_subs.add(dom)
+                  except Exception: continue
+              return None
+
+          def decrypt_url(api_resp: dict) -> str | None:
+              try:
+                  timestamp = api_resp["timestamp"]
+                  encrypted_bytes = base64.b64decode(api_resp["url"])
+                  time_key = floor(timestamp / 3600)
+                  secret_key_bytes = f"SECRET_KEY_{time_key}".encode("utf-8")
+                  cycled_key = cycle(secret_key_bytes)
+                  decrypted_bytes = bytearray(b ^ next(cycled_key) for b in encrypted_bytes)
+                  return decrypted_bytes.decode("utf-8", errors="ignore")
+              except Exception: return None
+
+          def download_bunkr(url: str, outdir: str):
+              api_resp = fetch_bunkr_api(url)
+              if not api_resp: sys.exit("ERROR: Failed to fetch API")
+              download_link = decrypt_url(api_resp)
+              if not download_link: sys.exit("ERROR: Failed to decrypt")
+              filepath = os.path.join(outdir, urlparse(download_link).path.rstrip("/").split("/")[-1])
+              resp = requests.get(download_link, headers=BUNKRR_DOWNLOAD_HEADERS, stream=True, timeout=120)
+              if resp.status_code != 200: sys.exit(f"ERROR: HTTP {resp.status_code}")
+              with open(filepath, "wb") as f:
+                  for chunk in resp.iter_content(chunk_size=8192):
+                      if chunk: f.write(chunk)
+              print(f"DONE:{filepath}")
+
+          if __name__ == "__main__":
+              if is_bunkr_url(sys.argv[1]): download_bunkr(sys.argv[1], sys.argv[2] if len(sys.argv)>2 else ".")
+          EOF
+
+      - name: Extract URLs and download files
+        shell: bash
+        run: |
+          OUT_DIR="dl"
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $MSG"
+
+          if echo "$MSG" | grep -qP 'dl-zip:'; then
+            MODE="zip"
+            URL_LINE=$(echo "$MSG" | grep -oP 'dl-zip:\s*\K.*' | tr '\n' ' ')
+          elif echo "$MSG" | grep -qP 'dl:'; then
+            MODE="normal"
+            URL_LINE=$(echo "$MSG" | grep -oP 'dl:\s*\K.*' | tr '\n' ' ')
+          else
+            echo "❌ No dl or dl-zip command found in commit message"
+            exit 1
+          fi
+
+          echo "Mode: $MODE"
+          rm -rf "$OUT_DIR" tmp_downloads process_dir
+          mkdir -p "$OUT_DIR" tmp_downloads
+
+          for URL in $URL_LINE; do
+            [ -z "$URL" ] && continue
+            echo "Processing: $URL"
+
+            if echo "$URL" | grep -qE "(bunkr\.si|bunkr\.fi|bunkr\.ru|bunkr\.cr|bunkr\.rip|bunkrr\.su)"; then
+              echo "⬇️ Downloading Bunkr: $URL"
+              python3 bunkr.py "$URL" "tmp_downloads"
+
+            elif echo "$URL" | grep -qE "(youtube\.com|youtu\.be|twitch\.tv|reddit\.com|vimeo|soundcloud)"; then
+              echo "⬇️ Downloading with yt-dlp: $URL"
+              COOKIE_ARG=""
+              if [ -s youtube_cookies.txt ]; then COOKIE_ARG="--cookies youtube_cookies.txt"; fi
+
+              yt-dlp --js-runtimes bun:$HOME/.bun/bin/bun $COOKIE_ARG -o "tmp_downloads/%(title)s.%(ext)s" "$URL"
+
+            else
+              echo "⬇️ Downloading with aria2: $URL"
+              aria2c \
+                --split=2 \
+                --max-connection-per-server=2 \
+                --min-split-size=95M \
+                --dir="tmp_downloads" \
+                "$URL"
+            fi
+          done
+
+          if [ "$MODE" = "zip" ]; then
+            ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S).zip"
+            mkdir -p process_dir
+            zip -j "process_dir/$ARCHIVE_NAME" tmp_downloads/*
+            rm -rf tmp_downloads
+            mv process_dir tmp_downloads
+          fi
+
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            LIMIT=$((95 * 1024 * 1024))
+            BASENAME=$(basename "$FILE")
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting with zip..."
+              rm -f "$OUT_DIR/${BASENAME}.zip" "$OUT_DIR/${BASENAME}.z"*
+              zip -s 95m "$OUT_DIR/${BASENAME}.zip" -j "$FILE"
+              echo "✅ Parts: $(ls $OUT_DIR/${BASENAME}* | wc -l)"
+            else
+              cp -f "$FILE" "$OUT_DIR/$BASENAME"
+            fi
+          done
+
+          rm -rf tmp_downloads process_dir
+
+      - name: Commit & Push
+        run: |
+          OUT_DIR="dl"
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "NET-Sentinel Bot"
+          git config user.email "224584266+NetSentinel-Bot@users.noreply.github.com"
+          git add "$OUT_DIR/"
+          git commit -m "Add downloaded files from commit [skip ci]" || echo "Nothing to commit"
+          echo "💎 Pushing to branch: $BRANCH"
+          git push origin HEAD:$BRANCH
